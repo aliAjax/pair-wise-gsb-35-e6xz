@@ -1,19 +1,94 @@
 <!doctype html>
 <html lang="zh-CN">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>大地测量网平差</title>
-<style>body{font:15px/1.5 system-ui,sans-serif;max-width:980px;margin:32px auto;padding:0 18px;color:#16202a}input,select,button{padding:7px;margin:3px}.card{border:1px solid #d9e1e8;border-radius:10px;padding:16px;margin:16px 0}pre{background:#f5f7f9;padding:12px;overflow:auto}button{cursor:pointer}small{color:#667}</style></head>
-<body><h1>大地测量网平差</h1><p>先初始化示例期次，再查看观测、执行平差，并用两个身份完成提交、审核和发布。</p>
-<div class="card"><h2>连接期次</h2><input id="epoch" type="number" value="1" placeholder="期次 ID"><button onclick="loadEpoch()">读取</button><span id="status"></span></div>
-<div class="card"><h2>观测与点数据</h2><button onclick="loadPoints()">点数据</button><button onclick="loadObservations()">观测</button><button onclick="adjust()">执行平差</button><button onclick="loadResults()">平差结果</button><pre id="output">等待操作…</pre></div>
-<div class="card"><h2>审核发布</h2><p>通过 X-User / X-Role 模拟审核身份。示例：alice=editor，bob=reviewer。</p><input id="user" value="alice"><select id="role"><option>editor</option><option>reviewer</option><option>viewer</option></select><button onclick="transition('submit')">提交复核</button><button onclick="transition('approve')">批准</button><button onclick="transition('publish')">发布</button></div>
-<script>
-const out=document.querySelector('#output'), status=document.querySelector('#status');
-const headers=()=>({'Content-Type':'application/json','X-User':document.querySelector('#user').value,'X-Role':document.querySelector('#role').value});
-async function req(url,opts={}){const r=await fetch(url,opts);const j=await r.json();out.textContent=JSON.stringify(j,null,2);if(!r.ok)throw Error(j.error||r.status);return j}
-async function loadEpoch(){try{const j=await req('/api/epochs/'+epoch.value);status.textContent=' '+j.status}catch(e){status.textContent=' '+e.message}}
-async function loadPoints(){await req('/api/epochs/'+epoch.value+'/points')}
-async function loadObservations(){await req('/api/epochs/'+epoch.value+'/observations')}
-async function loadResults(){await req('/api/epochs/'+epoch.value+'/results')}
-async function adjust(){await req('/api/epochs/'+epoch.value+'/adjust',{method:'POST',headers:headers(),body:'{}'});loadEpoch()}
-async function transition(action){await req('/api/epochs/'+epoch.value+'/transition/'+action,{method:'POST',headers:headers(),body:'{}'});loadEpoch()}
-</script></body></html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>大地测量网平差 · 录入与网形检查</title>
+<link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+<h1>大地测量网平差</h1>
+<p class="muted">录入控制点和观测后，系统把边长/角度按点连成平面网、高差单独成高程网，自动标出孤立点、断开的组和缺失的已知约束。<b>网形可解前不能提交复核</b>；调整点或观测后结论立即更新，重开页面仍可看到最近一次结论。</p>
+
+<div class="card">
+  <h2>连接期次</h2>
+  <div class="grid">
+    <label>期次 ID<input id="epoch" type="number" value="1" min="1"></label>
+    <button class="primary" onclick="loadEpoch(true)">读取</button>
+    <span id="status"></span>
+  </div>
+  <div class="grid" style="margin-top:10px">
+    <label>操作人<input id="user" value="alice"></label>
+    <label>角色<select id="role"><option>editor</option><option>reviewer</option><option>viewer</option></select></label>
+  </div>
+</div>
+
+<div class="card">
+  <h2>录入点（控制点 / 待求点）</h2>
+  <div class="grid">
+    <label>点号<input id="p-name" placeholder="如 C"></label>
+    <label>近似/已知 X<input id="p-x" type="number" step="any"></label>
+    <label>近似/已知 Y<input id="p-y" type="number" step="any"></label>
+    <label>近似/已知高程<input id="p-h" type="number" step="any"></label>
+    <label><input type="checkbox" id="p-xk"> X 已知</label>
+    <label><input type="checkbox" id="p-yk"> Y 已知</label>
+    <label><input type="checkbox" id="p-hk"> 高程已知</label>
+    <button onclick="savePoint()">保存点</button>
+  </div>
+  <table id="point-table"></table>
+</div>
+
+<div class="card">
+  <h2>录入观测</h2>
+  <div class="grid">
+    <label>类型<select id="o-kind"><option value="distance">边长（p1→p2）</option><option value="angle">角度（p1 测站，p2→p3）</option><option value="height_difference">高差（p1→p2）</option></select></label>
+    <label>p1<input id="o-p1" placeholder="起点/测站"></label>
+    <label>p2<input id="o-p2" placeholder="终点/照准点"></label>
+    <label id="o-p3">p3<input placeholder="另一照准点"></label>
+    <label>观测值<input id="o-value" type="number" step="any"></label>
+    <label>权<input id="o-weight" type="number" step="any" value="1"></label>
+    <button onclick="addObservation()">添加观测</button>
+  </div>
+  <table id="obs-table"></table>
+</div>
+
+<div class="card" id="check-card">
+  <h2>网形检查</h2>
+  <div class="grid" style="justify-content:space-between">
+    <div>
+      <button onclick="refreshCheck(true)">立即重新检查并保存结论</button>
+      <span id="check-time" class="muted" style="margin-left:10px"></span>
+    </div>
+  </div>
+  <div id="check-banner" class="banner idle">尚未读取期次。</div>
+  <div class="two-col">
+    <div>
+      <h3>平面网（边长 + 角度连接）</h3>
+      <div id="planar-groups"></div>
+    </div>
+    <div>
+      <h3>高程网（高差连接）</h3>
+      <div id="height-groups"></div>
+    </div>
+  </div>
+  <h3>问题与缺口（标明还缺哪段连接 / 哪个方向）</h3>
+  <div id="check-issues"></div>
+</div>
+
+<div class="card">
+  <h2>平差与审核发布</h2>
+  <div class="grid">
+    <button onclick="adjust()">执行平差</button>
+    <button onclick="loadResults()">查看平差结果</button>
+    <button id="btn-submit" class="primary" onclick="transition('submit')" disabled>提交复核</button>
+    <button onclick="transition('approve')">批准（reviewer）</button>
+    <button onclick="transition('publish')">发布（reviewer）</button>
+    <span id="submit-hint" class="muted"></span>
+  </div>
+  <pre id="result-box">平差结果将显示在这里…</pre>
+</div>
+
+<div id="toast" class="toast"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>

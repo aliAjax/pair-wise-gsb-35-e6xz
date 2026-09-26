@@ -16,7 +16,9 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import urlparse
+
+from network_check import check_network
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_DB = ROOT / "geodetic.db"
@@ -149,6 +151,12 @@ class Database:
                     details TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS network_checks (
+                    epoch_id INTEGER PRIMARY KEY REFERENCES epochs(id) ON DELETE CASCADE,
+                    solvable INTEGER NOT NULL,
+                    report TEXT NOT NULL,
+                    checked_at TEXT NOT NULL
+                );
                 """
             )
 
@@ -264,9 +272,66 @@ class Database:
             rows = conn.execute("SELECT * FROM observations WHERE epoch_id=? ORDER BY id", (epoch_id,)).fetchall()
         return [dict(row) for row in rows]
 
+    def evaluate_network(self, epoch_id: int) -> dict[str, Any]:
+        """按当前点数据和观测重算网形检查结论（纯读，不落库）。"""
+        self.get_epoch(epoch_id)
+        report = check_network(self.list_points(epoch_id), self.list_observations(epoch_id))
+        report["epoch_id"] = epoch_id
+        return report
+
+    def save_network_check(self, epoch_id: int, actor: str | None = None) -> dict[str, Any]:
+        """重算网形检查并把结论快照写库，重开页面仍可读取。"""
+        report = self.evaluate_network(epoch_id)
+        stamped = utcnow()
+        with self.connect() as conn:
+            conn.execute(
+                """INSERT INTO network_checks(epoch_id,solvable,report,checked_at) VALUES(?,?,?,?)
+                   ON CONFLICT(epoch_id) DO UPDATE SET solvable=excluded.solvable,
+                   report=excluded.report,checked_at=excluded.checked_at""",
+                (epoch_id, int(report["solvable"]), json.dumps(report, ensure_ascii=False), stamped),
+            )
+            if actor:
+                errors = [item["message"] for item in report["issues"] if item["severity"] == "error"]
+                self._audit(conn, epoch_id, actor, "network.checked",
+                            {"solvable": report["solvable"], "errors": errors[:10]})
+        report["checked_at"] = stamped
+        return report
+
+    def get_saved_network_check(self, epoch_id: int) -> dict[str, Any] | None:
+        self.get_epoch(epoch_id)
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM network_checks WHERE epoch_id=?", (epoch_id,)).fetchone()
+        if not row:
+            return None
+        report = json.loads(row["report"])
+        report["checked_at"] = row["checked_at"]
+        return report
+
+    def network_check_state(self, epoch_id: int) -> dict[str, Any]:
+        """始终按当前数据重算结论；附带最近一次保存快照的时间，供页面显示持久化状态。"""
+        report = self.evaluate_network(epoch_id)
+        saved = self.get_saved_network_check(epoch_id)
+        if saved is not None:
+            report["last_saved_at"] = saved["checked_at"]
+            report["snapshot_solvable"] = bool(saved["solvable"])
+        return report
+
     def transition(self, epoch_id: int, actor: str, role: str, action: str) -> dict[str, Any]:
         if role not in {"editor", "reviewer"}:
             raise DomainError("没有审核权限", 403)
+        current = self.get_epoch(epoch_id)
+        if action == "submit":
+            if role != "editor" or current["status"] != "draft":
+                raise DomainError("只有草稿可由编辑提交复核", 409)
+            # 闸门：用最新点/观测重算并快照；不可解直接拒绝，状态保持 draft。
+            report = self.save_network_check(epoch_id, actor)
+            if not report["solvable"]:
+                blockers = [item["message"] for item in report["issues"] if item["severity"] == "error"]
+                raise DomainError(
+                    "网形检查未通过，不能提交复核：" + "；".join(blockers[:5])
+                    + (" …" if len(blockers) > 5 else ""),
+                    422,
+                )
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute("SELECT * FROM epochs WHERE id=?", (epoch_id,)).fetchone()
@@ -500,6 +565,19 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _static(self, name: str) -> None:
+        path = (ROOT / "static" / name).resolve()
+        if ROOT.resolve() not in path.parents or not path.is_file():
+            raise DomainError("静态资源不存在", 404)
+        content_types = {".css": "text/css; charset=utf-8", ".js": "application/javascript; charset=utf-8",
+                         ".html": "text/html; charset=utf-8"}
+        body = path.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", content_types.get(path.suffix, "application/octet-stream"))
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def _body(self) -> dict[str, Any]:
         length = int(self.headers.get("Content-Length", "0"))
         if not length:
@@ -517,6 +595,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if parsed.path in {"/", "/index.html"}:
                 return self._html()
+            if parsed.path.startswith("/static/"):
+                return self._static(parsed.path[len("/static/"):])
             if parsed.path == "/api/health":
                 return self._json({"ok": True})
             parts = [p for p in parsed.path.split("/") if p]
@@ -530,6 +610,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"points": self.db.list_points(int(parts[2]))})
             if len(parts) == 4 and parts[:2] == ["api", "epochs"] and parts[3] == "results":
                 return self._json({"results": self.db.results(int(parts[2]))})
+            if len(parts) == 4 and parts[:2] == ["api", "epochs"] and parts[3] == "network-check":
+                return self._json(self.db.network_check_state(int(parts[2])))
             if len(parts) == 4 and parts[:2] == ["api", "epochs"] and parts[3] == "audit":
                 return self._json({"audit": self.db.audit(int(parts[2]))})
             if len(parts) == 5 and parts[:2] == ["api", "epochs"] and parts[3] == "compare":
@@ -562,6 +644,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json(result, 201)
                 if parts[3] == "adjust":
                     return self._json(self.db.adjust(epoch_id, actor, role))
+                if parts[3] == "network-check":
+                    return self._json(self.db.save_network_check(epoch_id, actor), 200)
             raise DomainError("接口不存在", 404)
         except (ValueError, DomainError, TypeError) as exc:
             self._json({"error": str(exc)}, getattr(exc, "status", 400))
