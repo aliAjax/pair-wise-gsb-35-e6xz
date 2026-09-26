@@ -18,6 +18,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from network_check import check_network
+
 ROOT = Path(__file__).resolve().parent
 DEFAULT_DB = ROOT / "geodetic.db"
 
@@ -264,6 +266,31 @@ class Database:
             rows = conn.execute("SELECT * FROM observations WHERE epoch_id=? ORDER BY id", (epoch_id,)).fetchall()
         return [dict(row) for row in rows]
 
+    def delete_observation(self, epoch_id: int, observation_id: int, actor: str, role: str = "editor") -> None:
+        if role != "editor":
+            raise DomainError("只有编辑人员可以维护观测资料", 403)
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            epoch = conn.execute("SELECT status FROM epochs WHERE id=?", (epoch_id,)).fetchone()
+            if not epoch:
+                raise DomainError("期次不存在", 404)
+            if epoch["status"] != "draft":
+                raise DomainError("只有草稿期次可以删除观测", 409)
+            row = conn.execute("SELECT id FROM observations WHERE id=? AND epoch_id=?", (observation_id, epoch_id)).fetchone()
+            if not row:
+                raise DomainError("观测不存在", 404)
+            conn.execute("DELETE FROM observations WHERE id=?", (observation_id,))
+            self._audit(conn, epoch_id, actor, "observation.deleted", {"id": observation_id})
+
+    def network_check(self, epoch_id: int) -> dict[str, Any]:
+        """按当前库内数据重新计算网形检查，只统计参与平差的有效观测。"""
+        self.get_epoch(epoch_id)
+        points = self.list_points(epoch_id)
+        observations = [o for o in self.list_observations(epoch_id) if o["status"] == "valid"]
+        result = check_network(points, observations)
+        result["epoch_id"] = epoch_id
+        return result
+
     def transition(self, epoch_id: int, actor: str, role: str, action: str) -> dict[str, Any]:
         if role not in {"editor", "reviewer"}:
             raise DomainError("没有审核权限", 403)
@@ -276,6 +303,15 @@ class Database:
             if action == "submit":
                 if role != "editor" or status != "draft":
                     raise DomainError("只有草稿可由编辑提交复核", 409)
+                points = [dict(r) for r in conn.execute("SELECT * FROM points WHERE epoch_id=?", (epoch_id,)).fetchall()]
+                observations = [dict(r) for r in conn.execute(
+                    "SELECT * FROM observations WHERE epoch_id=? AND status='valid'", (epoch_id,)).fetchall()]
+                check = check_network(points, observations)
+                if not check["solvable"]:
+                    reasons = "；".join(check["summary"][:5])
+                    if len(check["summary"]) > 5:
+                        reasons += f" 等 {len(check['summary'])} 项"
+                    raise DomainError("网形检查未通过，不能提交复核：" + reasons, 409)
                 conn.execute("UPDATE epochs SET status='review',submitted_by=? WHERE id=?", (actor, epoch_id))
             elif action == "approve":
                 if role != "reviewer" or status != "review":
@@ -526,6 +562,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(self.db.get_epoch(int(parts[2])))
             if len(parts) == 4 and parts[:2] == ["api", "epochs"] and parts[3] == "observations":
                 return self._json({"observations": self.db.list_observations(int(parts[2]))})
+            if len(parts) == 4 and parts[:2] == ["api", "epochs"] and parts[3] == "network-check":
+                return self._json({"check": self.db.network_check(int(parts[2]))})
             if len(parts) == 4 and parts[:2] == ["api", "epochs"] and parts[3] == "points":
                 return self._json({"points": self.db.list_points(int(parts[2]))})
             if len(parts) == 4 and parts[:2] == ["api", "epochs"] and parts[3] == "results":
@@ -564,6 +602,18 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json(self.db.adjust(epoch_id, actor, role))
             raise DomainError("接口不存在", 404)
         except (ValueError, DomainError, TypeError) as exc:
+            self._json({"error": str(exc)}, getattr(exc, "status", 400))
+
+    def do_DELETE(self) -> None:
+        parsed = urlparse(self.path)
+        try:
+            actor, role = self._actor()
+            parts = [p for p in parsed.path.split("/") if p]
+            if len(parts) == 5 and parts[:2] == ["api", "epochs"] and parts[3] == "observations":
+                self.db.delete_observation(int(parts[2]), int(parts[4]), actor, role)
+                return self._json({"ok": True})
+            raise DomainError("接口不存在", 404)
+        except (ValueError, DomainError) as exc:
             self._json({"error": str(exc)}, getattr(exc, "status", 400))
 
     def log_message(self, fmt: str, *args: Any) -> None:

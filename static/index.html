@@ -1,19 +1,205 @@
 <!doctype html>
 <html lang="zh-CN">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>大地测量网平差</title>
-<style>body{font:15px/1.5 system-ui,sans-serif;max-width:980px;margin:32px auto;padding:0 18px;color:#16202a}input,select,button{padding:7px;margin:3px}.card{border:1px solid #d9e1e8;border-radius:10px;padding:16px;margin:16px 0}pre{background:#f5f7f9;padding:12px;overflow:auto}button{cursor:pointer}small{color:#667}</style></head>
-<body><h1>大地测量网平差</h1><p>先初始化示例期次，再查看观测、执行平差，并用两个身份完成提交、审核和发布。</p>
-<div class="card"><h2>连接期次</h2><input id="epoch" type="number" value="1" placeholder="期次 ID"><button onclick="loadEpoch()">读取</button><span id="status"></span></div>
-<div class="card"><h2>观测与点数据</h2><button onclick="loadPoints()">点数据</button><button onclick="loadObservations()">观测</button><button onclick="adjust()">执行平差</button><button onclick="loadResults()">平差结果</button><pre id="output">等待操作…</pre></div>
-<div class="card"><h2>审核发布</h2><p>通过 X-User / X-Role 模拟审核身份。示例：alice=editor，bob=reviewer。</p><input id="user" value="alice"><select id="role"><option>editor</option><option>reviewer</option><option>viewer</option></select><button onclick="transition('submit')">提交复核</button><button onclick="transition('approve')">批准</button><button onclick="transition('publish')">发布</button></div>
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>大地测量网平差</title>
+<style>
+body{font:15px/1.5 system-ui,sans-serif;max-width:1080px;margin:32px auto;padding:0 18px;color:#16202a}
+input,select,button{padding:7px;margin:3px}
+.card{border:1px solid #d9e1e8;border-radius:10px;padding:16px;margin:16px 0}
+pre{background:#f5f7f9;padding:12px;overflow:auto}
+button{cursor:pointer}
+button:disabled{cursor:not-allowed;opacity:.5}
+small{color:#667}
+h3{margin:14px 0 6px}
+.ok{color:#0a7a3d}.bad{color:#b3261e}.note{color:#667}
+.banner{padding:10px 14px;border-radius:8px;margin:8px 0;font-weight:600}
+.banner.ok{background:#e6f4ea}.banner.bad{background:#fdecea}
+.chip{display:inline-block;border:1px solid #d9e1e8;border-radius:16px;padding:3px 10px;margin:2px;background:#f8fafc}
+.chip.ok{border-color:#9ed3ae;background:#eefaf1}.chip.bad{border-color:#f0b4ae;background:#fdf1f0}
+.net{border-top:1px dashed #d9e1e8;padding-top:8px;margin-top:10px}
+ul.issues{padding-left:18px;margin:6px 0}
+ul.issues li{margin:4px 0}
+.tip{color:#0b5cad}
+table{border-collapse:collapse;margin:8px 0}
+th,td{border:1px solid #d9e1e8;padding:4px 8px;text-align:left}
+label{white-space:nowrap}
+</style></head>
+<body>
+<h1>大地测量网平差</h1>
+<p>录入控制点和观测后，网形检查会立即标出孤立点、断开的组和缺失的已知约束，并给出需要补测的连接或方向；网形可解后才能提交复核。</p>
+
+<div class="card">
+  <h2>连接期次</h2>
+  <input id="epoch" type="number" value="1" placeholder="期次 ID"><button onclick="loadEpoch()">读取</button><span id="status"></span>
+</div>
+
+<div class="card">
+  <h2>数据录入</h2>
+  <h3>控制点 / 待求点</h3>
+  <div>
+    <input id="p-point" placeholder="点号" size="6">
+    <input id="p-x" type="number" placeholder="x" size="9">
+    <input id="p-y" type="number" placeholder="y" size="9">
+    <input id="p-elev" type="number" placeholder="高程" size="8">
+    <label><input id="p-xk" type="checkbox">x 已知</label>
+    <label><input id="p-yk" type="checkbox">y 已知</label>
+    <label><input id="p-ek" type="checkbox">高程已知</label>
+    <button onclick="savePoint()">保存点</button>
+  </div>
+  <h3>观测</h3>
+  <div>
+    <select id="o-kind"><option value="distance">边长</option><option value="angle">角度</option><option value="height_difference">高程差</option></select>
+    <input id="o-p1" placeholder="p1（角度时为测站）" size="14">
+    <input id="o-p2" placeholder="p2" size="6">
+    <input id="o-p3" placeholder="p3（角度）" size="8">
+    <input id="o-value" type="number" placeholder="观测值" size="10">
+    <input id="o-weight" type="number" value="1" placeholder="权" size="4">
+    <button onclick="addObservation()">录入观测</button>
+  </div>
+  <div id="obs-list"></div>
+</div>
+
+<div class="card">
+  <h2>网形检查</h2>
+  <div id="check-summary"><small>读取期次后自动检查。</small></div>
+  <div id="check-nets"></div>
+</div>
+
+<div class="card">
+  <h2>平差与成果</h2>
+  <button onclick="adjust()">执行平差</button><button onclick="loadResults()">平差结果</button><button onclick="loadPoints()">点数据</button>
+  <pre id="output">等待操作…</pre>
+</div>
+
+<div class="card">
+  <h2>审核发布</h2>
+  <p>通过 X-User / X-Role 模拟审核身份。示例：alice=editor，bob=reviewer。</p>
+  <input id="user" value="alice"><select id="role"><option>editor</option><option>reviewer</option><option>viewer</option></select>
+  <button id="btn-submit" onclick="transition('submit')">提交复核</button>
+  <button onclick="transition('approve')">批准</button><button onclick="transition('publish')">发布</button>
+  <div><small id="submit-hint"></small></div>
+</div>
+
 <script>
-const out=document.querySelector('#output'), status=document.querySelector('#status');
-const headers=()=>({'Content-Type':'application/json','X-User':document.querySelector('#user').value,'X-Role':document.querySelector('#role').value});
-async function req(url,opts={}){const r=await fetch(url,opts);const j=await r.json();out.textContent=JSON.stringify(j,null,2);if(!r.ok)throw Error(j.error||r.status);return j}
-async function loadEpoch(){try{const j=await req('/api/epochs/'+epoch.value);status.textContent=' '+j.status}catch(e){status.textContent=' '+e.message}}
-async function loadPoints(){await req('/api/epochs/'+epoch.value+'/points')}
-async function loadObservations(){await req('/api/epochs/'+epoch.value+'/observations')}
-async function loadResults(){await req('/api/epochs/'+epoch.value+'/results')}
-async function adjust(){await req('/api/epochs/'+epoch.value+'/adjust',{method:'POST',headers:headers(),body:'{}'});loadEpoch()}
-async function transition(action){await req('/api/epochs/'+epoch.value+'/transition/'+action,{method:'POST',headers:headers(),body:'{}'});loadEpoch()}
+const $=s=>document.querySelector(s);
+const KIND_LABEL={distance:'边长',angle:'角度',height_difference:'高程差'};
+let lastCheck=null;
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const headers=()=>({'Content-Type':'application/json','X-User':$('#user').value,'X-Role':$('#role').value});
+const epochId=()=>$('#epoch').value;
+const store={get:k=>{try{return localStorage.getItem(k)}catch(e){return null}},set:(k,v)=>{try{localStorage.setItem(k,v)}catch(e){}}};
+
+async function req(url,opts={}){
+  const r=await fetch(url,opts);
+  const j=await r.json();
+  if(!r.ok){log(j);throw new Error(j.error||r.status)}
+  return j;
+}
+function log(obj){$('#output').textContent=typeof obj==='string'?obj:JSON.stringify(obj,null,2)}
+
+async function loadEpoch(){
+  const id=epochId();
+  try{
+    const j=await req('/api/epochs/'+id);
+    $('#status').textContent=' '+j.status;
+    store.set('geodetic.epoch',id);
+    await Promise.all([refreshObservations(),refreshCheck()]);
+  }catch(e){$('#status').textContent=' '+e.message}
+}
+
+async function refreshCheck(){
+  try{
+    const j=await req('/api/epochs/'+epochId()+'/network-check');
+    lastCheck=j.check;renderCheck();
+  }catch(e){
+    $('#check-summary').innerHTML='<div class="banner bad">网形检查不可用：'+esc(e.message)+'</div>';
+  }
+}
+
+function renderCheck(){
+  const c=lastCheck;
+  if(!c)return;
+  $('#check-summary').innerHTML=c.solvable
+    ?'<div class="banner ok">✔ 网形可解：平面网与高程网连通、已知约束充足，可以提交复核。</div>'
+    :'<div class="banner bad">✘ 网形存在 '+c.issues.length+' 处缺口：补齐下列问题前不能提交复核。</div>';
+  $('#check-nets').innerHTML=netBlock('平面网（边长 + 角度）',c.planar)+netBlock('高程网（高程差）',c.elevation);
+  $('#btn-submit').disabled=!c.solvable;
+  $('#submit-hint').textContent=c.solvable?'':'网形检查未通过，提交复核已禁用';
+}
+
+function netBlock(title,net){
+  const comps=net.components.map(comp=>{
+    const tags=[];
+    if(comp.isolated)tags.push('孤立点');
+    if(comp.unknown_points.length===0)tags.push('全部为已知点');
+    tags.push(comp.datum_ok?'基准完整':'缺已知约束');
+    const known=comp.known_points.length?'（已知：'+comp.known_points.join('、')+'）':'';
+    return '<span class="chip '+(comp.datum_ok?'ok':'bad')+'">'+esc(comp.points.join('、'))+esc(known)+' · '+tags.join('，')+'</span>';
+  }).join(' ')||'<small>暂无点</small>';
+  const issues=net.issues.map(i=>'<li>⚠ '+esc(i.message)+(i.suggestion?'<br><span class="tip">建议：'+esc(i.suggestion)+'</span>':'')+'</li>').join('');
+  const notes=net.notes.map(n=>'<li class="note">'+esc(n)+'</li>').join('');
+  return '<div class="net"><h3>'+title+' '+(net.ok?'<span class="ok">✔ 可解</span>':'<span class="bad">✘ 有缺口</span>')+'</h3>'
+    +'<div>'+comps+'</div>'
+    +(issues?'<ul class="issues">'+issues+'</ul>':'')
+    +(notes?'<ul class="issues">'+notes+'</ul>':'')+'</div>';
+}
+
+async function refreshObservations(){
+  const j=await req('/api/epochs/'+epochId()+'/observations');
+  const rows=j.observations.map(o=>
+    '<tr><td>'+o.id+'</td><td>'+esc(KIND_LABEL[o.kind]||o.kind)+'</td><td>'+esc(o.p1)+'</td><td>'+esc(o.p2)+'</td>'
+    +'<td>'+esc(o.p3||'')+'</td><td>'+o.value+'</td><td>'+o.weight+'</td><td>'+esc(o.status)+'</td>'
+    +'<td><button onclick="delObs('+o.id+')">删除</button></td></tr>').join('');
+  $('#obs-list').innerHTML=rows
+    ?'<table><tr><th>ID</th><th>类型</th><th>p1</th><th>p2</th><th>p3</th><th>值</th><th>权</th><th>状态</th><th></th></tr>'+rows+'</table>'
+    :'<small>尚未录入观测。</small>';
+}
+
+const numOrNull=s=>{const v=$(s).value.trim();return v===''?null:Number(v)};
+
+async function savePoint(){
+  const body={point:$('#p-point').value,x:numOrNull('#p-x'),y:numOrNull('#p-y'),elevation:numOrNull('#p-elev'),
+    x_known:$('#p-xk').checked,y_known:$('#p-yk').checked,elevation_known:$('#p-ek').checked};
+  await req('/api/epochs/'+epochId()+'/points',{method:'POST',headers:headers(),body:JSON.stringify(body)});
+  log('点 '+body.point+' 已保存');
+  await refreshCheck();
+}
+
+async function addObservation(){
+  const body={kind:$('#o-kind').value,p1:$('#o-p1').value,p2:$('#o-p2').value,
+    value:Number($('#o-value').value),weight:Number($('#o-weight').value||'1')};
+  const p3=$('#o-p3').value.trim();
+  if(p3)body.p3=p3;
+  const j=await req('/api/epochs/'+epochId()+'/observations',{method:'POST',headers:headers(),body:JSON.stringify(body)});
+  log(j);
+  await Promise.all([refreshObservations(),refreshCheck()]);
+}
+
+async function delObs(id){
+  await req('/api/epochs/'+epochId()+'/observations/'+id,{method:'DELETE',headers:headers()});
+  log('观测 '+id+' 已删除');
+  await Promise.all([refreshObservations(),refreshCheck()]);
+}
+
+async function adjust(){
+  const j=await req('/api/epochs/'+epochId()+'/adjust',{method:'POST',headers:headers(),body:'{}'});
+  log(j);
+  await Promise.all([refreshObservations(),refreshCheck()]);
+}
+
+async function loadPoints(){log(await req('/api/epochs/'+epochId()+'/points'))}
+async function loadResults(){log(await req('/api/epochs/'+epochId()+'/results'))}
+
+async function transition(action){
+  try{
+    const j=await req('/api/epochs/'+epochId()+'/transition/'+action,{method:'POST',headers:headers(),body:'{}'});
+    log(j);
+    $('#status').textContent=' '+j.status;
+  }catch(e){/* 错误已显示在输出区 */}
+}
+
+window.addEventListener('DOMContentLoaded',()=>{
+  $('#epoch').value=store.get('geodetic.epoch')||'1';
+  loadEpoch();
+});
 </script></body></html>
